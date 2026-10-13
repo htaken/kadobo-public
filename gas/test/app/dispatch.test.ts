@@ -1,0 +1,360 @@
+import { createHmac } from "node:crypto";
+import { buttonIdempotencyKey } from "@kadobo/shared/ids";
+import { ENVELOPE_VERSION, envelopeSigningString, type GasRequest } from "@kadobo/shared/protocol";
+import { describe, expect, it } from "vitest";
+import { dispatch, handlePostBody } from "../../src/app/dispatch";
+import { makeFakePorts } from "./fakes";
+
+const SECRET = "test-shared-secret-DO-NOT-USE-IN-PROD";
+
+function hmacHex(key: string, msg: string): string {
+  return createHmac("sha256", key).update(msg, "utf8").digest("hex");
+}
+
+function buildEnvelope(payloadObj: unknown, opts: { ts?: number; nonce?: string; secret?: string } = {}) {
+  const payload = JSON.stringify(payloadObj);
+  const ts = opts.ts ?? 1756260000;
+  const nonce = opts.nonce ?? "0123456789abcdef0123456789abcdef";
+  const secret = opts.secret ?? SECRET;
+  const sig = hmacHex(secret, envelopeSigningString(ts, nonce, payload));
+  return { v: ENVELOPE_VERSION, ts, nonce, payload, sig };
+}
+
+function makeStampPayload(): Extract<GasRequest, { kind: "stamp" }> {
+  const messageTs = "1756260000.000100";
+  const actionTs = "1756260120.000100";
+  return {
+    kind: "stamp",
+    idempotency_key: buttonIdempotencyKey({
+      user_id: "U1",
+      message_ts: messageTs,
+      action_id: "kado_start",
+      action_ts: actionTs,
+    }),
+    user_id: "U1",
+    channel_id: "C1",
+    message_ts: messageTs,
+    action_id: "kado_start",
+    occurred_at_ms: Date.parse("2026-09-01T09:02:00+09:00"),
+    received_at_ms: Date.parse("2026-09-01T09:02:00+09:00") + 400,
+    source: "button",
+  };
+}
+
+function readyPorts() {
+  // envelope の既定 ts（1756260000 秒）と一致させ、窓判定が常に通るようにする。
+  const ports = makeFakePorts(1756260000 * 1000);
+  ports.props.set("GAS_SHARED_SECRET", SECRET);
+  return ports;
+}
+
+describe("handlePostBody — 本文が JSON でない", () => {
+  it("MALFORMED_BODY, retryable:false", () => {
+    const ports = readyPorts();
+    const result = handlePostBody("{not json", ports);
+    expect(result).toEqual({ ok: false, error: "MALFORMED_BODY", retryable: false });
+  });
+});
+
+describe("dispatch — 封筒不正", () => {
+  it("署名不一致は UNAUTHORIZED, retryable:false", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope(makeStampPayload(), { secret: "wrong-secret" });
+    const result = dispatch(envelope, ports);
+    expect(result).toEqual({ ok: false, error: "UNAUTHORIZED", retryable: false });
+  });
+
+  it("窓外（古い ts）は UNAUTHORIZED", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope(makeStampPayload(), { ts: 1756260000 - 301 });
+    const result = dispatch(envelope, ports);
+    expect(result).toEqual({ ok: false, error: "UNAUTHORIZED", retryable: false });
+  });
+});
+
+describe("dispatch — payload の型不正", () => {
+  it("GasRequest の形をしていなければ BAD_REQUEST, retryable:false", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope({ kind: "stamp", user_id: "U1" }); // 必須フィールド欠落
+    const result = dispatch(envelope, ports);
+    expect(result).toEqual({ ok: false, error: "BAD_REQUEST", retryable: false });
+  });
+
+  it("kind が未知の値なら BAD_REQUEST", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope({ kind: "unknown_kind" });
+    const result = dispatch(envelope, ports);
+    expect(result).toEqual({ ok: false, error: "BAD_REQUEST", retryable: false });
+  });
+});
+
+describe("dispatch — 正常系ディスパッチ", () => {
+  it("stamp を実際に処理する（生ログ追記まで確認）", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope(makeStampPayload());
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.rawLog).toHaveLength(1);
+    expect(ports.sheets.rawLog[0]?.event_type).toBe("START");
+  });
+
+  it("同じ nonce の再送は REPLAY として UNAUTHORIZED になる", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope(makeStampPayload());
+    dispatch(envelope, ports);
+    const second = dispatch(envelope, ports);
+    expect(second).toEqual({ ok: false, error: "UNAUTHORIZED", retryable: false });
+  });
+});
+
+describe("dispatch — LockService 取得不可", () => {
+  it("LOCK_TIMEOUT, retryable:true", () => {
+    const ports = readyPorts();
+    ports.lock.throwTimeoutOnce = true;
+    const envelope = buildEnvelope(makeStampPayload());
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "LOCK_TIMEOUT", retryable: true });
+  });
+});
+
+describe("dispatch — 一時エラー", () => {
+  it("Sheets 等の例外は retryable:true", () => {
+    const ports = readyPorts();
+    ports.sheets.findRawLogByIdempotencyKey = () => {
+      throw new Error("sheets_temporary_error");
+    };
+    const envelope = buildEnvelope(makeStampPayload());
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "sheets_temporary_error", retryable: true });
+  });
+});
+
+describe("dispatch — month_close（実装設計 MF連携 §5.3, §10.1, §11.2 契約テスト）", () => {
+  function makeMonthClosePayload(
+    overrides: Partial<Extract<GasRequest, { kind: "month_close" }>> = {},
+  ): Extract<GasRequest, { kind: "month_close" }> {
+    const messageTs = "1756260000.000100";
+    const actionTs = "1756260120.000100";
+    const base: Extract<GasRequest, { kind: "month_close" }> = {
+      kind: "month_close",
+      idempotency_key: buttonIdempotencyKey({
+        user_id: "U1",
+        message_ts: messageTs,
+        action_id: "kado_month_close",
+        action_ts: actionTs,
+      }),
+      user_id: "U1",
+      channel_id: "C1",
+      message_ts: messageTs,
+      client: "A社",
+      month: "2026-10",
+      shown_net_amount: 0,
+      received_at_ms: 1756260000000,
+      source: "button",
+    };
+    return { ...base, ...overrides };
+  }
+
+  function readyMonthCloseSheets(ports: ReturnType<typeof readyPorts>): void {
+    // recomputeMonthly が単価エラーを note に書くと hasMonthBlockers が true になってしまうため、
+    // 単価マスタを用意しておく（実装設計 §5.1 末尾の blockers 定義）。
+    ports.sheets.unitPrices.push({
+      client: "A社",
+      unit_price: 1800,
+      tax_category: "課税",
+      tax_inclusive: false,
+      tax_display: "区分記載",
+      rounding: "切捨",
+      withholding: "なし",
+      valid_from: "2026-01-01",
+      valid_to: null,
+    });
+    ports.sheets.monthlyBills.set("A社|2026-10", {
+      client: "A社",
+      month: "2026-10",
+      worked_minutes: 0,
+      hours: 0,
+      unit_price: 0,
+      amount: 0,
+      tax_amount: 0,
+      withholding_amount: 0,
+      net_amount: 0,
+      state: "REVIEWING",
+      mf_invoice_id: null,
+      locked_at: null,
+      note: null,
+      updated_at: 1,
+      invoice_state: "",
+      invoice_error: null,
+      invoice_attempted_at: null,
+      close_card_ts: "1756260000.000100",
+    });
+  }
+
+  it("BAD_REQUEST に落ちない: isGasRequest（validateRequest）を通り、routeRequest 経由で処理される", () => {
+    const ports = readyPorts();
+    readyMonthCloseSheets(ports);
+    const envelope = buildEnvelope(makeMonthClosePayload());
+
+    const result = dispatch(envelope, ports);
+
+    // 締まって applied:true になる（NOT_READY/BAD_REQUEST のいずれでもない）。
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.getMonthlyBill("A社", "2026-10")?.state).toBe("LOCKED");
+  });
+
+  it("必須フィールド欠落は BAD_REQUEST（validateRequest に case が無いと落ちる回帰防止）", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope({ kind: "month_close", user_id: "U1" });
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "BAD_REQUEST", retryable: false });
+  });
+
+  it("withLock の中で呼ばれる: ロック取得不可なら LOCK_TIMEOUT", () => {
+    const ports = readyPorts();
+    readyMonthCloseSheets(ports);
+    ports.lock.throwTimeoutOnce = true;
+    const envelope = buildEnvelope(makeMonthClosePayload());
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "LOCK_TIMEOUT", retryable: true });
+  });
+
+  it("契約テスト: Worker が生成する封筒（HMAC-SHA256, 同じ signing_string 形式）を GAS の実際の検証" +
+    "（verifyEnvelope → isGasRequest/validateRequest → routeRequest）がそのまま受理する", () => {
+    const ports = readyPorts();
+    readyMonthCloseSheets(ports);
+    // Worker（webcrypto）と同じ HMAC-SHA256・signing_string 形式で、Worker と全く同じ手順
+    // （buildEnvelope 相当）で署名した封筒を、GAS 側の実装（dispatch）にそのまま渡す。
+    const payload = makeMonthClosePayload();
+    const envelope = buildEnvelope(payload);
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+  });
+});
+
+describe("dispatch — expense_submit（実装設計 経費フェーズ §5.8）", () => {
+  // stamp 系のテストが使う既定 ts（1756260000 秒 = 2025-08-27）は req.date（2026-09-01）より
+  // 過去になり「未来の日付」検証に落ちるため、expense_submit 用に独自の ts・クロックを使う。
+  const EXPENSE_TS_SEC = Math.floor(Date.parse("2026-09-01T12:00:00+09:00") / 1000);
+
+  function readyExpensePorts() {
+    const ports = makeFakePorts(EXPENSE_TS_SEC * 1000);
+    ports.props.set("GAS_SHARED_SECRET", SECRET);
+    return ports;
+  }
+
+  function makeExpensePayload(
+    overrides: Partial<Extract<GasRequest, { kind: "expense_submit" }>> = {},
+  ): Extract<GasRequest, { kind: "expense_submit" }> {
+    const base: Extract<GasRequest, { kind: "expense_submit" }> = {
+      kind: "expense_submit",
+      idempotency_key: "V1:0123456789abcdef",
+      user_id: "U1",
+      view_id: "V1",
+      channel_id: "C1",
+      receipt_type: "paper",
+      date: "2026-09-01",
+      amount: 1200,
+      category: "消耗品費",
+      partner: "○○商店",
+      memo: "",
+      file: {
+        id: "F1",
+        name: "receipt.jpg",
+        mimetype: "image/jpeg",
+        filetype: "jpg",
+        size: 8,
+        url_private: "https://files.slack.com/files-pri/T1-F1/receipt.jpg",
+      },
+      received_at_ms: EXPENSE_TS_SEC * 1000,
+      source: "modal",
+    };
+    return { ...base, ...overrides };
+  }
+
+  it("handleExpenseSubmit を経由して正常に処理される（BAD_REQUEST に落ちない）", () => {
+    const ports = readyExpensePorts();
+    const envelope = buildEnvelope(makeExpensePayload(), { ts: EXPENSE_TS_SEC });
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses).toHaveLength(1);
+  });
+
+  // 実装設計 MF連携 §10.2・§11.2 WP-M2/M4: `payment_method` は任意項目。
+  it("payment_method 無し（旧 Worker からの pending 再送）は BAD_REQUEST にならず、台帳には空で書かれる", () => {
+    const ports = readyExpensePorts();
+    const payload = makeExpensePayload();
+    expect("payment_method" in payload).toBe(false);
+
+    const result = dispatch(buildEnvelope(payload, { ts: EXPENSE_TS_SEC }), ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses[0]!.payment_method).toBe("");
+  });
+
+  it("payment_method 有り（有効値）は受理され、台帳の支払方法列に書かれる", () => {
+    const ports = readyExpensePorts();
+
+    const result = dispatch(
+      buildEnvelope(makeExpensePayload({ payment_method: "cash" }), { ts: EXPENSE_TS_SEC }),
+      ports,
+    );
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses[0]!.payment_method).toBe("cash");
+  });
+
+  it("payment_method が不正な値なら BAD_REQUEST", () => {
+    const ports = readyExpensePorts();
+    const bad = { ...makeExpensePayload(), payment_method: "bitcoin" };
+
+    const result = dispatch(buildEnvelope(bad, { ts: EXPENSE_TS_SEC }), ports);
+
+    expect(result).toEqual({ ok: false, error: "BAD_REQUEST", retryable: false });
+    expect(ports.sheets.expenses).toHaveLength(0);
+  });
+
+  it("ロック外で呼ばれる: フェーズ2の最中に別のロック取得（打刻相当）が成功する", () => {
+    const ports = readyExpensePorts();
+    let concurrentLockSucceeded = false;
+    const originalDownload = ports.slackFiles.download.bind(ports.slackFiles);
+    ports.slackFiles.download = (url: string) => {
+      ports.lock.withLock(() => {
+        concurrentLockSucceeded = true;
+      });
+      return originalDownload(url);
+    };
+    const envelope = buildEnvelope(makeExpensePayload(), { ts: EXPENSE_TS_SEC });
+
+    const result = dispatch(envelope, ports);
+
+    expect(concurrentLockSucceeded).toBe(true);
+    expect(result).toEqual({ ok: true, applied: true });
+  });
+
+  it("ユースケース内の例外は他の種別と同じく retryable:true にマップされる", () => {
+    const ports = readyExpensePorts();
+    ports.sheets.updateExpense = () => {
+      throw new Error("sheets_temporary_error");
+    };
+    const envelope = buildEnvelope(makeExpensePayload(), { ts: EXPENSE_TS_SEC });
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "sheets_temporary_error", retryable: true });
+  });
+});
